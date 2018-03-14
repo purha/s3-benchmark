@@ -3,6 +3,8 @@
 *.dll
 *.so
 *.dylib
+benchmark.log
+s3-benchmark
 
 # Test binary, build with `go test -c`
 *.test
