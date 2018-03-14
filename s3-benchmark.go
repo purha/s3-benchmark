@@ -12,11 +12,6 @@ import (
 	"encoding/base64"
 	"flag"
 	"fmt"
-	"github.com/aws/aws-sdk-go/aws"
-	"github.com/aws/aws-sdk-go/aws/credentials"
-	"github.com/aws/aws-sdk-go/aws/session"
-	"github.com/aws/aws-sdk-go/service/s3"
-	"github.com/pivotal-golang/bytefmt"
 	"io"
 	"io/ioutil"
 	"log"
@@ -30,10 +25,17 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"code.cloudfoundry.org/bytefmt"
+	"github.com/aws/aws-sdk-go/aws"
+	"github.com/aws/aws-sdk-go/aws/awserr"
+	"github.com/aws/aws-sdk-go/aws/credentials"
+	"github.com/aws/aws-sdk-go/aws/session"
+	"github.com/aws/aws-sdk-go/service/s3"
 )
 
 // Global variables
-var access_key, secret_key, url_host, bucket string
+var access_key, secret_key, url_host, bucket, region string
 var duration_secs, threads, loops int
 var object_size uint64
 var object_data []byte
@@ -76,7 +78,7 @@ func getS3Client() *s3.S3 {
 	loglevel := aws.LogOff
 	// Build the rest of the configuration
 	awsConfig := &aws.Config{
-		Region:               aws.String("us-east-1"),
+		Region:               aws.String(region),
 		Endpoint:             aws.String(url_host),
 		Credentials:          creds,
 		LogLevel:             &loglevel,
@@ -110,19 +112,35 @@ func deleteAllObjects() {
 	// Use multiple routines to do the actual delete
 	var doneDeletes sync.WaitGroup
 	// Loop deleting our versions reading as big a list as we can
-	var keyMarker, versionId *string
+	var continuationToken *string
+
 	var err error
 	for loop := 1; ; loop++ {
 		// Delete all the existing objects and versions in the bucket
-		in := &s3.ListObjectVersionsInput{Bucket: aws.String(bucket), KeyMarker: keyMarker, VersionIdMarker: versionId, MaxKeys: aws.Int64(1000)}
-		if listVersions, listErr := client.ListObjectVersions(in); listErr == nil {
+		in := &s3.ListObjectsV2Input{Bucket: aws.String(bucket), MaxKeys: aws.Int64(1000), ContinuationToken: continuationToken}
+
+		if err != nil {
+			if aerr, ok := err.(awserr.Error); ok {
+				switch aerr.Code() {
+				case s3.ErrCodeNoSuchBucket:
+					fmt.Println(s3.ErrCodeNoSuchBucket, aerr.Error())
+				default:
+					fmt.Println(aerr.Error())
+				}
+			} else {
+				// Print the error, cast err to awserr.Error to get the Code and
+				// Message from an error.
+				fmt.Println(err.Error())
+			}
+			return
+		}
+
+		if result, listErr := client.ListObjectsV2(in); listErr == nil {
 			delete := &s3.Delete{Quiet: aws.Bool(true)}
-			for _, version := range listVersions.Versions {
-				delete.Objects = append(delete.Objects, &s3.ObjectIdentifier{Key: version.Key, VersionId: version.VersionId})
+			for i := range result.Contents {
+				delete.Objects = append(delete.Objects, &s3.ObjectIdentifier{Key: result.Contents[i].Key})
 			}
-			for _, marker := range listVersions.DeleteMarkers {
-				delete.Objects = append(delete.Objects, &s3.ObjectIdentifier{Key: marker.Key, VersionId: marker.VersionId})
-			}
+
 			if len(delete.Objects) > 0 {
 				// Start a delete routine
 				doDelete := func(bucket string, delete *s3.Delete) {
@@ -134,20 +152,13 @@ func deleteAllObjects() {
 				doneDeletes.Add(1)
 				go doDelete(bucket, delete)
 			}
-			// Advance to next versions
-			if listVersions.IsTruncated == nil || !*listVersions.IsTruncated {
+
+			if result.IsTruncated == nil || !*result.IsTruncated {
 				break
 			}
-			keyMarker = listVersions.NextKeyMarker
-			versionId = listVersions.NextVersionIdMarker
-		} else {
-			// The bucket may not exist, just ignore in that case
-			if strings.HasPrefix(listErr.Error(), "NoSuchBucket") {
-				return
-			}
-			err = fmt.Errorf("ListObjectVersions unexpected failure: %v", listErr)
-			break
+			in.ContinuationToken = result.ContinuationToken
 		}
+
 	}
 	// Wait for deletes to finish
 	doneDeletes.Wait()
@@ -272,6 +283,7 @@ func main() {
 	myflag := flag.NewFlagSet("myflag", flag.ExitOnError)
 	myflag.StringVar(&access_key, "a", "", "Access key")
 	myflag.StringVar(&secret_key, "s", "", "Secret key")
+	myflag.StringVar(&region, "r", "us-east-1", "Region")
 	myflag.StringVar(&url_host, "u", "http://s3.wasabisys.com", "URL for host with method prefix")
 	myflag.StringVar(&bucket, "b", "wasabi-benchmark-bucket", "Bucket for testing")
 	myflag.IntVar(&duration_secs, "d", 60, "Duration of each test in seconds")
